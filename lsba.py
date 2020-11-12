@@ -32,7 +32,7 @@ def decode_uleb128(data, size):
         shift += 7
         if (ord(data[i]) & 0x80) == 0:
             break
-    return (val, len)
+    return val, len
 
 
 def decode_leb128(data, size):
@@ -48,7 +48,7 @@ def decode_leb128(data, size):
     if (shift < size) & ((ord(data[i]) & 0x40) != 0):
         val |= -(1 << shift)
 
-    return (val, len)
+    return val, len
 
 
 def read_debug_line(data, size, target_addr, debug):
@@ -90,18 +90,18 @@ def read_debug_line(data, size, target_addr, debug):
             break;
 
         """
-            read prologue
+            read prologue (prologue is line number program header)
         """
 
         prologue = {}
 
         # read header
         temp = struct.unpack("<LHLBBBBB", data[indx: indx + 15])
-        prologue["total_length"] = temp[0]
+        prologue["unit_length"] = temp[0]
         prologue["version"] = temp[1]
-        prologue["prologue_length"] = temp[2]
+        prologue["header_length"] = temp[2]
         prologue["minimum_instruction_length"] = temp[3]
-        prologue["default_is_stms"] = temp[4]
+        prologue["default_is_stmt"] = temp[4]
         prologue["line_base"] = temp[5]
         prologue["line_range"] = temp[6]
         prologue["opcode_base"] = temp[7]
@@ -124,7 +124,7 @@ def read_debug_line(data, size, target_addr, debug):
 
         # read include directories
         dir = []
-        temp_dir = data[indx: i + prologue["total_length"]].split('\0')
+        temp_dir = data[indx: i + prologue["unit_length"]].split('\0')
         temp_len = 0
         for i in range(0, len(temp_dir)):
             dir.append(copy.copy(temp_dir[i]))
@@ -142,24 +142,22 @@ def read_debug_line(data, size, target_addr, debug):
         file_names = []
         i = indx
         while 1:
+            # first entry
             # read file_name
-            file_name = data[i: i + prologue["total_length"]].split('\0')[0]
+            file_name = data[i: i + prologue["unit_length"]].split('\0')[0]
             i += len(file_name) + 1
 
             # read dir_indx
-            uleb128 = decode_uleb128(data[i: i + prologue["total_length"]], prologue["prologue_length"])
-            dir_indx = uleb128[0]
-            i += uleb128[1]
+            dir_indx, length = decode_uleb128(data[i: i + prologue["unit_length"]], prologue["header_length"])
+            i += length
 
             # read file time
-            uleb128 = decode_uleb128(data[i: i + prologue["total_length"]], prologue["prologue_length"])
-            file_time = uleb128[0]
-            i += uleb128[1]
+            file_time, length = decode_uleb128(data[i: i + prologue["unit_length"]], prologue["header_length"])
+            i += length
 
             # read file length
-            uleb128 = decode_uleb128(data[i: i + prologue["total_length"]], prologue["prologue_length"])
-            file_len = uleb128[0]
-            i += uleb128[1]
+            file_len, length = decode_uleb128(data[i: i + prologue["unit_length"]], prologue["header_length"])
+            i += length
 
             file_names.append(copy.copy(file_name))
 
@@ -185,11 +183,12 @@ def read_debug_line(data, size, target_addr, debug):
         bypass_until = 0
         sm = { "address" : 0, "file" : 1, "line" : 1, "column" : 0, "is_stmt" : 0, "basic_block" : "false", "end_sequence" : "false" }
 
-        for i in range(indx, stmt_ptr + prologue["total_length"]):
+        end_cu_indx = stmt_ptr + prologue["unit_length"]
+        for i in range(indx, end_cu_indx):
             opcode = ord(data[i])
 
             if debug == 1:
-                print "    i =", i, "indx =", indx, "stmt_ptr =", stmt_ptr, "total_length =", prologue["total_length"]
+                print "    i =", i, "indx =", indx, "stmt_ptr =", stmt_ptr, "unit_length =", prologue["unit_length"]
                 print "    opcode = 0x%02X" % opcode
                 print "    base_addr = 0x%02X" % base_addr, "address = 0x%02X" % sm["address"], "target_addr = 0x%02X" % target_addr
                 print ""
@@ -225,10 +224,10 @@ def read_debug_line(data, size, target_addr, debug):
             elif opcode == 0:
                 # extended opcode
 
-                uleb128 = decode_uleb128(data[i + 1], stmt_ptr + prologue["total_length"] - i)
-                opcode = ord(data[i + uleb128[1] + 1])
+                val, length = decode_uleb128(data[i + 1], end_cu_indx - i)
+                opcode = ord(data[i + length + 1])
                 # enable bypass operation
-                bypass_until = i + uleb128[1] + uleb128[0] + 1
+                bypass_until = i + value + length + 1
 
                 if opcode == DW_LNE_end_sequence:
 
@@ -276,30 +275,27 @@ def read_debug_line(data, size, target_addr, debug):
                     sm["basic_block"] = "false"
 
                 elif opcode == DW_LNS_advance_pc:
-                    leb128 = decode_uleb128(data[i + 1: stmt_ptr + prologue["total_length"]], stmt_ptr + prologue["total_length"] - i)
-                    sm["address"] += leb128[0] * prologue["minimum_instruction_length"]
+                    val, length = decode_uleb128(data[i + 1: end_cu_indx], end_cu_indx - i)
+                    sm["address"] += val * prologue["minimum_instruction_length"]
 
                     # enable bypass operation
-                    bypass_until = i + leb128[1] + 1
+                    bypass_until = i + length + 1
 
                 elif opcode == DW_LNS_advance_line:
-                    leb128 = decode_leb128(data[i + 1: stmt_ptr + prologue["total_length"]], stmt_ptr + prologue["total_length"] - i)
-                    sm["line"] += leb128[0]
+                    val, length = decode_leb128(data[i + 1: end_cu_indx], end_cu_indx - i)
+                    sm["line"] += val
                     # enable bypass operation
-                    bypass_until = i + leb128[1] + 1
+                    bypass_until = i + length + 1
 
                 elif opcode == DW_LNS_set_file:
-                    leb128 = decode_uleb128(data[i + 1: stmt_ptr + prologue["total_length"]], stmt_ptr + prologue["total_length"] - i)
-                    sm["file"] = leb128[0]
+                    sm["file"] , length = decode_uleb128(data[i + 1: end_cu_indx], end_cu_indx - i)
                     # enable bypass operation
-                    bypass_until = i + leb128[1] + 1
+                    bypass_until = i + length + 1
 
                 elif opcode == DW_LNS_set_column:
-                    leb128 = decode_uleb128(data[i + 1: stmt_ptr + prologue["total_length"]], stmt_ptr + prologue["total_length"] - i)
-                    sm["column"] = leb128[0]
-
+                     sm["column"], length = decode_uleb128(data[i + 1: end_cu_indx], end_cu_indx - i)
                     # enable bypass operation
-                    bypass_until = i + leb128[1] + 1
+                    bypass_until = i + length + 1
 
                 elif opcode == DW_LNS_negate_stmt:
                     if sm["is_stmt"] == "true":
@@ -315,7 +311,7 @@ def read_debug_line(data, size, target_addr, debug):
 
 
                 elif opcode == DW_LNS_fixed_advance_pc:
-                    adv = struct.unpack("<H", data[i + 1: stmt_ptr + prologue["total_length"]])
+                    adv = struct.unpack("<H", data[i + 1: end_cu_indx])
                     sm["address"] += adv
 
                     # enable bypass operation
@@ -340,7 +336,7 @@ def read_debug_line(data, size, target_addr, debug):
             go to the next prologue
         """
 
-        indx = stmt_ptr + prologue["total_length"]
+        indx = end_cu_indx
 
         # round up to 4 byets aligned
         indx = ((indx + 4 - 1) / 4) * 4
